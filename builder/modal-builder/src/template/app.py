@@ -231,7 +231,7 @@ def run(input: Input):
 async def bar(request_input: RequestInput):
     # print(request_input)
     if not deploy_test:
-        return run.remote(request_input.input)
+        return run.spawn(request_input.input)
     # pass
 
 
