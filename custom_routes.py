@@ -22,11 +22,14 @@ from logging.handlers import RotatingFileHandler
 from enum import Enum
 from urllib.parse import quote
 import threading
+import hashlib
+import aiohttp
 
 api = None
 api_task = None
 prompt_metadata = {}
 cd_enable_log = os.environ.get('CD_ENABLE_LOG', 'false').lower() == 'true'
+cd_enable_run_log = os.environ.get('CD_ENABLE_RUN_LOG', 'false').lower() == 'true'
 
 def post_prompt(json_data):
     prompt_server = server.PromptServer.instance
@@ -98,6 +101,7 @@ async def comfy_deploy_run(request):
     prompt_metadata[prompt_id] = {
         'status_endpoint': data.get('status_endpoint'),
         'file_upload_endpoint': data.get('file_upload_endpoint'),
+        'workflow_api': workflow_api
     }
 
     try:
@@ -141,6 +145,138 @@ async def comfy_deploy_run(request):
     return web.json_response(res, status=status)
 
 sockets = dict()
+
+def get_comfyui_path_from_file_path(file_path):
+    file_path_parts = file_path.split("\\")
+
+    if file_path_parts[0] == "input":
+        print("matching input")
+        file_path = os.path.join(folder_paths.get_directory_by_type("input"), *file_path_parts[1:])
+    elif file_path_parts[0] == "models":
+        print("matching models")
+        file_path = folder_paths.get_full_path(file_path_parts[1], os.path.join(*file_path_parts[2:]))
+
+    print(file_path)
+
+    return file_path
+
+# Form ComfyUI Manager
+def compute_sha256_checksum(filepath):
+    filepath = get_comfyui_path_from_file_path(filepath)
+    """Compute the SHA256 checksum of a file, in chunks"""
+    sha256 = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096), b''):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+# This is start uploading the files to Comfy Deploy
+@server.PromptServer.instance.routes.post('/comfyui-deploy/upload-file')
+async def upload_file(request):
+    data = await request.json()
+
+    file_path = data.get("file_path")
+
+    print("Original file path", file_path)
+
+    file_path = get_comfyui_path_from_file_path(file_path)
+
+    # return web.json_response({
+    #     "error": f"File not uploaded"
+    # }, status=500)
+
+    token = data.get("token")
+    get_url = data.get("url")
+
+    try:
+        base = folder_paths.base_path
+        file_path = os.path.join(base, file_path)
+        
+        if os.path.exists(file_path):
+            file_size = os.path.getsize(file_path)
+            file_extension = os.path.splitext(file_path)[1]
+
+            if file_extension in ['.jpg', '.jpeg']:
+                file_type = 'image/jpeg'
+            elif file_extension == '.png':
+                file_type = 'image/png'
+            elif file_extension == '.webp':
+                file_type = 'image/webp'
+            else:
+                file_type = 'application/octet-stream'  # Default to binary file type if unknown
+        else:
+            return web.json_response({
+                "error": f"File not found: {file_path}"
+            }, status=404)
+
+    except Exception as e:
+        return web.json_response({
+            "error": str(e)
+        }, status=500)
+
+    if get_url:
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {'Authorization': f'Bearer {token}'}
+                params = {'file_size': file_size, 'type': file_type}
+                async with session.get(get_url, params=params, headers=headers) as response:
+                    if response.status == 200:
+                        content = await response.json()
+                        upload_url = content["upload_url"]
+
+                        with open(file_path, 'rb') as f:
+                            headers = {
+                                "Content-Type": file_type,
+                                "x-amz-acl": "public-read",
+                                "Content-Length": str(file_size)
+                            }
+                            async with session.put(upload_url, data=f, headers=headers) as upload_response:
+                                if upload_response.status == 200:
+                                    return web.json_response({
+                                        "message": "File uploaded successfully",
+                                        "download_url": content["download_url"]
+                                    })
+                                else:
+                                    return web.json_response({
+                                        "error": f"Failed to upload file to {upload_url}. Status code: {upload_response.status}"
+                                    }, status=upload_response.status)
+                    else:
+                        return web.json_response({
+                            "error": f"Failed to fetch data from {get_url}. Status code: {response.status}"
+                        }, status=response.status)
+        except Exception as e:
+            return web.json_response({
+                "error": f"An error occurred while fetching data from {get_url}: {str(e)}"
+            }, status=500)
+        
+    return web.json_response({
+        "error": f"File not uploaded"
+    }, status=500)
+        
+
+@server.PromptServer.instance.routes.get('/comfyui-deploy/get-file-hash')
+async def get_file_hash(request):
+    file_path = request.rel_url.query.get('file_path', '')
+
+    if file_path is None:
+        return web.json_response({
+            "error": "file_path is required"
+        }, status=400)
+    
+    try:
+        base = folder_paths.base_path
+        file_path = os.path.join(base, file_path)
+        # print("file_path", file_path)
+        file_hash = compute_sha256_checksum(
+            file_path
+        )
+        return web.json_response({
+            "file_hash": file_hash
+        })
+    except Exception as e:
+        return web.json_response({
+            "error": str(e)
+        }, status=500)
 
 @server.PromptServer.instance.routes.get('/comfyui-deploy/ws')
 async def websocket_handler(request):
@@ -220,6 +356,15 @@ async def send_json_override(self, event, data, sid=None):
         if not have_pending_upload(prompt_id):
             update_run(prompt_id, Status.SUCCESS)
 
+    if event == 'executing' and data.get('node') is not None:
+        node = data.get('node')
+        if 'last_updated_node' in prompt_metadata[prompt_id] and prompt_metadata[prompt_id]['last_updated_node'] == node:
+            return
+        prompt_metadata[prompt_id]['last_updated_node'] = node
+        class_type = prompt_metadata[prompt_id]['workflow_api'][node]['class_type']
+        print("updating run live status", class_type)
+        await update_run_live_status(prompt_id, "Executing " + class_type)
+
     if event == 'execution_error':
         # Careful this might not be fully awaited.
         await update_run_with_output(prompt_id, data)
@@ -239,7 +384,26 @@ class Status(Enum):
     FAILED = "failed"
     UPLOADING = "uploading"
 
+# Global variable to keep track of the last read line number
+last_read_line_number = 0
+
+async def update_run_live_status(prompt_id, live_status):
+    if prompt_id not in prompt_metadata:
+        return
+    
+    status_endpoint = prompt_metadata[prompt_id]['status_endpoint']
+    body = {
+        "run_id": prompt_id,
+        "live_status": live_status,
+    }
+    # requests.post(status_endpoint, json=body)
+    async with aiohttp.ClientSession() as session:
+        await session.post(status_endpoint, json=body)
+
+
 def update_run(prompt_id, status: Status):
+    global last_read_line_number
+
     if prompt_id not in prompt_metadata:
         return
 
@@ -254,16 +418,50 @@ def update_run(prompt_id, status: Status):
             "run_id": prompt_id,
             "status": status.value,
         }
-        prompt_metadata[prompt_id]['status'] = status
         print(f"Status: {status.value}")
 
         try:
             requests.post(status_endpoint, json=body)
+
+            if cd_enable_run_log and (status == Status.SUCCESS or status == Status.FAILED):
+                try:
+                    with open(comfyui_file_path, 'r') as log_file:
+                        # log_data = log_file.read()
+                        # Move to the last read line
+                        all_log_data = log_file.read()  # Read all log data
+                        print("All log data before skipping:", all_log_data)  # Log all data before skipping
+                        log_file.seek(0)  # Reset file pointer to the beginning
+                        
+                        for _ in range(last_read_line_number):
+                            next(log_file)
+                        log_data = log_file.read()
+                        # Update the last read line number
+                        last_read_line_number += log_data.count('\n')
+                        print("last_read_line_number", last_read_line_number)
+                        print("log_data", log_data)
+                        print("log_data.count(n)", log_data.count('\n'))
+
+                        body = {
+                            "run_id": prompt_id,
+                            "log_data": [
+                                {
+                                    "logs": log_data,
+                                    # "timestamp": time.time(),
+                                }
+                            ]
+                        }
+                        requests.post(status_endpoint, json=body)
+                except Exception as log_error:
+                    print(f"Error reading log file: {log_error}")
+                
+
         except Exception as e:
             error_type = type(e).__name__
             stack_trace = traceback.format_exc().strip()
             print(f"Error occurred while updating run: {e} {stack_trace}")
-
+        finally:
+            prompt_metadata[prompt_id]['status'] = status
+            
 
 async def upload_file(prompt_id, filename, subfolder=None, content_type="image/png", type="output"):
     """
@@ -449,6 +647,7 @@ prompt_server.send_json = send_json_override.__get__(prompt_server, server.Promp
 root_path = os.path.dirname(os.path.abspath(__file__))
 two_dirs_up = os.path.dirname(os.path.dirname(root_path))
 log_file_path = os.path.join(two_dirs_up, 'comfy-deploy.log')
+comfyui_file_path = os.path.join(two_dirs_up, 'comfyui.log')
 
 last_read_line = 0
 
